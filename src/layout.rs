@@ -427,6 +427,22 @@ pub fn apply_window_region(hwnd: HWND, hrgn: HRGN, redraw: bool) -> Result<(), N
     Ok(())
 }
 
+/// Clears any custom `SetWindowRgn` clip on `hwnd` (e.g., when switching from Vertical to Topbar/Zen).
+pub fn clear_window_region(hwnd: HWND, redraw: bool) -> Result<(), NyariError> {
+    if hwnd.is_invalid() {
+        return Err(NyariError::InvalidInput(
+            "HWND must not be null".to_string(),
+        ));
+    }
+
+    let cleared = unsafe { SetWindowRgn(hwnd, None, redraw) };
+    if cleared == 0 {
+        return Err(win32_last_error_or("SetWindowRgn(None) failed"));
+    }
+
+    Ok(())
+}
+
 /// Hides the dynamic resize border ring when maximized/fullscreen, or updates its `HRGN` and shows `SW_SHOWNOACTIVATE`.
 pub fn update_resize_ring(
     ring_hwnd: HWND,
@@ -787,10 +803,11 @@ mod tests {
             assert!(DeleteObject(ring_rgn.into()).as_bool());
         }
 
-        // Verify failure cleanup path in apply_window_region / update_resize_ring on invalid HWND.
+        // Verify failure cleanup path in apply_window_region / clear_window_region / update_resize_ring on invalid HWND.
         let invalid_target_rgn = build_resize_ring_region(100, 100, 6).unwrap();
         assert!(apply_window_region(HWND::default(), invalid_target_rgn, false).is_err());
         assert!(apply_window_region(HWND::default(), HRGN::default(), false).is_err());
+        assert!(clear_window_region(HWND::default(), false).is_err());
         assert!(update_resize_ring(HWND::default(), 100, 100, 96, false).is_err());
     }
 
@@ -1115,6 +1132,8 @@ mod tests {
         // Windows takes ownership of `ring_rgn` on success; do not DeleteObject afterwards.
         apply_window_region(parent_guard.0, ring_rgn, false)
             .expect("SetWindowRgn should accept valid HWND and region");
+        clear_window_region(parent_guard.0, false)
+            .expect("clear_window_region should reset region on valid HWND");
 
         update_resize_ring(child, 640, 480, 144, false)
             .expect("update_resize_ring restored should succeed");
