@@ -1,7 +1,9 @@
 use std::fmt;
 
 pub mod cli;
+pub mod ipc;
 pub mod single_instance;
+pub mod storage;
 
 /// Unified error type shared across Nyari Browser subsystems.
 #[derive(Debug)]
