@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use windows::core::{HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
-    ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED,
-    ERROR_SUCCESS, FALSE, GENERIC_ALL, GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0, WIN32_ERROR,
+    ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_NOT_FOUND,
+    ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, ERROR_SUCCESS, FALSE, GENERIC_ALL,
+    GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, SetEntriesInAclW, EXPLICIT_ACCESS_W, SET_ACCESS, TRUSTEE_IS_SID,
@@ -295,7 +295,7 @@ pub fn acquire_or_forward_named(
     }))
 }
 
-fn query_current_user_token_buf() -> Result<Vec<u8>, NyariError> {
+fn query_current_user_token_buf() -> Result<Vec<u64>, NyariError> {
     let mut raw_token = HANDLE::default();
     unsafe {
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token)?;
@@ -313,23 +313,29 @@ fn query_current_user_token_buf() -> Result<Vec<u8>, NyariError> {
         return Err(NyariError::Other("TokenUser buffer size too small".into()));
     }
 
-    let mut buf = vec![0u8; needed as usize];
+    // Back buffer with u64 words so pointer meets x86_64 alignment for TOKEN_USER.
+    let word_len = (needed as usize).div_ceil(size_of::<u64>());
+    let mut buf = vec![0u64; word_len];
+    let buf_bytes = u32::try_from(word_len * size_of::<u64>())
+        .map_err(|_| NyariError::Other("TokenUser buffer size overflow".into()))?;
     unsafe {
         GetTokenInformation(
             token.as_raw(),
             TokenUser,
             Some(buf.as_mut_ptr().cast()),
-            needed,
+            buf_bytes,
             &mut needed,
         )?;
     }
     Ok(buf)
 }
 
-fn token_user_sid(token_buf: &[u8]) -> Result<PSID, NyariError> {
-    if token_buf.len() < size_of::<TOKEN_USER>() {
+fn token_user_sid(token_buf: &[u64]) -> Result<PSID, NyariError> {
+    const _: () = assert!(std::mem::align_of::<TOKEN_USER>() <= std::mem::align_of::<u64>());
+    if std::mem::size_of_val(token_buf) < size_of::<TOKEN_USER>() {
         return Err(NyariError::Other("truncated TOKEN_USER buffer".into()));
     }
+    debug_assert!(token_buf.as_ptr().cast::<TOKEN_USER>().is_aligned());
     let token_user = unsafe { &*(token_buf.as_ptr().cast::<TOKEN_USER>()) };
     let sid = token_user.User.Sid;
     if sid.0.is_null() || !unsafe { IsValidSid(sid) }.as_bool() {
@@ -458,6 +464,21 @@ fn is_event_signaled(event: HANDLE) -> bool {
     unsafe { WaitForSingleObject(event, 0) == WAIT_OBJECT_0 }
 }
 
+fn cancel_and_drain_overlapped(pipe: HANDLE, overlapped: &OVERLAPPED) {
+    let cancel_res = unsafe { CancelIoEx(pipe, Some(overlapped)) };
+    let should_drain = match cancel_res {
+        Ok(()) => true,
+        Err(err) => err.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0),
+    };
+    if should_drain {
+        let mut transferred = 0u32;
+        if let Err(err) = unsafe { GetOverlappedResult(pipe, overlapped, &mut transferred, true) } {
+            // ERROR_OPERATION_ABORTED is expected once cancellation completes.
+            let _ = err.code() == HRESULT::from_win32(ERROR_OPERATION_ABORTED.0);
+        }
+    }
+}
+
 fn connect_overlapped(
     pipe: HANDLE,
     stop_event: HANDLE,
@@ -480,9 +501,7 @@ fn connect_overlapped(
                 let handles = [stop_event, io_event];
                 let wait = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
                 if wait == WAIT_OBJECT_0 {
-                    unsafe {
-                        let _ = CancelIoEx(pipe, Some(&overlapped));
-                    }
+                    cancel_and_drain_overlapped(pipe, &overlapped);
                     Ok(false)
                 } else if wait.0 == WAIT_OBJECT_0.0 + 1 {
                     let mut transferred = 0u32;
@@ -491,6 +510,7 @@ fn connect_overlapped(
                     }
                     Ok(true)
                 } else {
+                    cancel_and_drain_overlapped(pipe, &overlapped);
                     Err(windows::core::Error::from_thread().into())
                 }
             } else {
@@ -546,12 +566,11 @@ fn read_client_messages(
                 let handles = [stop_event, io_event];
                 let wait = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
                 if wait == WAIT_OBJECT_0 {
-                    unsafe {
-                        let _ = CancelIoEx(pipe, Some(&overlapped));
-                    }
+                    cancel_and_drain_overlapped(pipe, &overlapped);
                     return;
                 }
                 if wait.0 != WAIT_OBJECT_0.0 + 1 {
+                    cancel_and_drain_overlapped(pipe, &overlapped);
                     break;
                 }
                 let mut transferred = 0u32;
@@ -772,5 +791,56 @@ mod tests {
             (Some(_), Some(_)) => panic!("both racers acquired primary mutex!"),
             (None, None) => panic!("neither racer acquired primary mutex!"),
         }
+    }
+
+    #[test]
+    fn drop_cancels_pending_read_cleanly() {
+        use super::{to_wide_null, write_all_to_pipe, HandleGuard};
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::GENERIC_WRITE;
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING,
+        };
+        use windows::Win32::System::Pipes::WaitNamedPipeW;
+
+        let id = uuid::Uuid::new_v4();
+        let mutex_name = format!(r"Local\NyariBrowser_CancelRead_Mutex_{id}");
+        let sid = user_sid_string().expect("sid");
+        let pipe_name = format!(r"\\.\pipe\NyariBrowser_CancelRead_Pipe_{sid}_{id}");
+
+        let (tx, rx) = mpsc::channel::<Vec<String>>();
+        let guard = acquire_or_forward_named(&mutex_name, &pipe_name, &[], move |urls| {
+            let _ = tx.send(urls);
+        })
+        .expect("primary acquire should succeed")
+        .expect("should own primary guard");
+
+        // Keep client handle open after writing one line so the server parks in overlapped ReadFile.
+        let pipe_wide = to_wide_null(&pipe_name);
+        let ready = unsafe { WaitNamedPipeW(PCWSTR(pipe_wide.as_ptr()), 500) };
+        assert!(ready.as_bool(), "pipe should become ready");
+        let client_raw = unsafe {
+            CreateFileW(
+                PCWSTR(pipe_wide.as_ptr()),
+                GENERIC_WRITE.0,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        }
+        .expect("client pipe open should succeed");
+        let _client = HandleGuard::new(client_raw).expect("valid client handle");
+
+        write_all_to_pipe(_client.as_raw(), b"[\"https://pending-read.example\"]\n")
+            .expect("write should succeed");
+        let received = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("primary should receive line while client stays open");
+        assert_eq!(received, vec!["https://pending-read.example".to_string()]);
+
+        // Dropping guard while ReadFile is pending must cancel & drain IRP cleanly without hang/UB.
+        drop(guard);
     }
 }
