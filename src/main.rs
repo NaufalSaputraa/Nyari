@@ -948,43 +948,64 @@ fn open_stub_tab(state: &Rc<RefCell<AppState>>, url: Option<String>, is_private:
     broadcast_active_tab(state);
 }
 
-fn handle_shortcut(state: &Rc<RefCell<AppState>>, shortcut: ShortcutAction) {
-    let (active_kind, c2_opt) = {
-        let mut st = state.borrow_mut();
-        match shortcut {
-            ShortcutAction::OpenCommandPalette => {
-                st.overlay_stack.find_in_page_open = false;
-                st.overlay_stack.command_palette_open = true;
-            }
-            ShortcutAction::OpenFindInPage => {
-                st.overlay_stack.command_palette_open = false;
-                st.overlay_stack.find_in_page_open = true;
-            }
-            ShortcutAction::CloseActiveOverlay => {
-                if st.overlay_stack.command_palette_open {
-                    st.overlay_stack.command_palette_open = false;
-                } else if st.overlay_stack.find_in_page_open {
-                    st.overlay_stack.find_in_page_open = false;
-                } else if st.overlay_stack.hover_sidebar_open {
-                    st.overlay_stack.hover_sidebar_open = false;
-                } else if st.overlay_stack.reading_mode_open {
-                    st.overlay_stack.reading_mode_open = false;
-                }
-            }
+fn pop_top_non_modal_overlay(stack: &mut OverlayPriorityStack) {
+    if stack.command_palette_open {
+        stack.command_palette_open = false;
+    } else if stack.find_in_page_open {
+        stack.find_in_page_open = false;
+    } else if stack.reading_mode_open {
+        stack.reading_mode_open = false;
+    } else if stack.hover_sidebar_open {
+        stack.hover_sidebar_open = false;
+    }
+}
+
+fn apply_shortcut_transition(
+    stack: &mut OverlayPriorityStack,
+    shortcut: ShortcutAction,
+    notify_ui: bool,
+) -> (Option<ActiveOverlayKind>, Option<UIEvent>) {
+    match shortcut {
+        ShortcutAction::OpenCommandPalette => {
+            stack.find_in_page_open = false;
+            stack.command_palette_open = true;
         }
-        let snapshot = (
-            st.overlay_stack.active_kind(),
-            st.layer2_controller.borrow().clone(),
-        );
-        snapshot
+        ShortcutAction::OpenFindInPage => {
+            stack.command_palette_open = false;
+            stack.find_in_page_open = true;
+        }
+        ShortcutAction::CloseActiveOverlay => {
+            pop_top_non_modal_overlay(stack);
+        }
+    }
+    let active_kind = stack.active_kind();
+    let ui_event = notify_ui.then_some(UIEvent::ShortcutTriggered { action: shortcut });
+    (active_kind, ui_event)
+}
+
+fn handle_shortcut_internal(
+    state: &Rc<RefCell<AppState>>,
+    shortcut: ShortcutAction,
+    notify_ui: bool,
+) {
+    let (active_kind, ui_event, c2_opt) = {
+        let mut st = state.borrow_mut();
+        let (active_kind, ui_event) =
+            apply_shortcut_transition(&mut st.overlay_stack, shortcut, notify_ui);
+        let c2_opt = st.layer2_controller.borrow().clone();
+        (active_kind, ui_event, c2_opt)
     };
 
-    if let Some(c2) = c2_opt {
-        let _ = post_ui_event(&c2, &UIEvent::ShortcutTriggered { action: shortcut });
+    if let (Some(c2), Some(ev)) = (c2_opt, ui_event) {
+        let _ = post_ui_event(&c2, &ev);
     }
     if active_kind.is_none() {
         hide_layer2_popup(state, true);
     }
+}
+
+fn handle_shortcut(state: &Rc<RefCell<AppState>>, shortcut: ShortcutAction) {
+    handle_shortcut_internal(state, shortcut, true);
 }
 
 /// Processes a `UIAction` from Shell UI; returns `true` if the application should exit.
@@ -1049,7 +1070,7 @@ fn handle_ui_action(
             }
         }
         UIAction::CloseOverlay => {
-            handle_shortcut(state, ShortcutAction::CloseActiveOverlay);
+            handle_shortcut_internal(state, ShortcutAction::CloseActiveOverlay, false);
         }
         UIAction::WindowMinimize => {
             main_window.set_minimized(true);
@@ -1777,6 +1798,34 @@ mod tests {
         assert_eq!(
             sync_active_tab_script(None),
             "window.__NYARI_SET_ACTIVE_TAB__?.(null);"
+        );
+    }
+
+    #[test]
+    fn close_overlay_from_ui_pops_stack_without_echoing_shortcut_event() {
+        // Stacked overlays: CommandPalette over ReadingMode.
+        let mut stack = OverlayPriorityStack::new();
+        stack.command_palette_open = true;
+        stack.reading_mode_open = true;
+
+        // UIAction::CloseOverlay (notify_ui = false) pops only CommandPalette and emits no UIEvent.
+        let (active_after_ui_close, event_from_ui) =
+            apply_shortcut_transition(&mut stack, ShortcutAction::CloseActiveOverlay, false);
+        assert_eq!(active_after_ui_close, Some(ActiveOverlayKind::ReadingMode));
+        assert!(!stack.command_palette_open);
+        assert!(stack.reading_mode_open);
+        assert_eq!(event_from_ui, None);
+
+        // ShortcutAction::CloseActiveOverlay (notify_ui = true) pops ReadingMode and emits ShortcutTriggered.
+        let (active_after_shortcut, event_from_shortcut) =
+            apply_shortcut_transition(&mut stack, ShortcutAction::CloseActiveOverlay, true);
+        assert_eq!(active_after_shortcut, None);
+        assert!(!stack.reading_mode_open);
+        assert_eq!(
+            event_from_shortcut,
+            Some(UIEvent::ShortcutTriggered {
+                action: ShortcutAction::CloseActiveOverlay,
+            })
         );
     }
 }

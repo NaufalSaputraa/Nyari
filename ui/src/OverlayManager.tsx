@@ -69,6 +69,8 @@ function FindInPageBar({ onClose }: { onClose: () => void }) {
           if (e.key === "Enter" && tabId) {
             sendAction({ type: "FIND_NEXT", tabId, forward: !e.shiftKey });
           } else if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
             onClose();
           }
         }}

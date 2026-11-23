@@ -180,6 +180,7 @@ export function CommandPalette({ onClose }: CommandPaletteProps) {
               executeQueryOrSelection();
             } else if (e.key === "Escape") {
               e.preventDefault();
+              e.stopPropagation();
               onClose();
             }
           }}
