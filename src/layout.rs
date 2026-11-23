@@ -75,6 +75,28 @@ pub struct WindowLayoutRects {
     pub resize_border_phys: i32,
 }
 
+/// Internal Layer 2 overlay identity distinguishing Find-in-Page from Command Palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveOverlayKind {
+    Modal,
+    CommandPalette,
+    FindInPage,
+    ReadingMode,
+    HoverSidebar,
+}
+
+impl ActiveOverlayKind {
+    /// Maps the internal overlay kind to its IPC [`OverlaySurface`] for `SET_OVERLAY_BOUNDS`.
+    pub const fn to_ipc_surface(self) -> OverlaySurface {
+        match self {
+            Self::Modal => OverlaySurface::Modal,
+            Self::CommandPalette | Self::FindInPage => OverlaySurface::CommandPalette,
+            Self::ReadingMode => OverlaySurface::ReadingMode,
+            Self::HoverSidebar => OverlaySurface::HoverSidebar,
+        }
+    }
+}
+
 /// Priority-ordered single-surface controller for the Layer 2 owned popup window.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OverlayPriorityStack {
@@ -124,19 +146,26 @@ impl OverlayPriorityStack {
         self.modal_queue.len()
     }
 
-    /// Resolves the highest-priority active surface (`Modal > CommandPalette/FindInPage > ReadingMode > HoverSidebar`).
-    pub fn active_surface(&self) -> Option<OverlaySurface> {
+    /// Resolves the highest-priority active overlay kind (`Modal > CommandPalette > FindInPage > ReadingMode > HoverSidebar`).
+    pub fn active_kind(&self) -> Option<ActiveOverlayKind> {
         if !self.modal_queue.is_empty() {
-            Some(OverlaySurface::Modal)
-        } else if self.command_palette_open || self.find_in_page_open {
-            Some(OverlaySurface::CommandPalette)
+            Some(ActiveOverlayKind::Modal)
+        } else if self.command_palette_open {
+            Some(ActiveOverlayKind::CommandPalette)
+        } else if self.find_in_page_open {
+            Some(ActiveOverlayKind::FindInPage)
         } else if self.reading_mode_open {
-            Some(OverlaySurface::ReadingMode)
+            Some(ActiveOverlayKind::ReadingMode)
         } else if self.hover_sidebar_open {
-            Some(OverlaySurface::HoverSidebar)
+            Some(ActiveOverlayKind::HoverSidebar)
         } else {
             None
         }
+    }
+
+    /// Resolves the highest-priority active surface (`Modal > CommandPalette/FindInPage > ReadingMode > HoverSidebar`).
+    pub fn active_surface(&self) -> Option<OverlaySurface> {
+        self.active_kind().map(ActiveOverlayKind::to_ipc_surface)
     }
 
     /// Applies an activation guard disposition, dismissing transient surfaces while preserving modals and reading mode.
@@ -189,6 +218,7 @@ pub struct ActivationEffects {
     pub dismiss_glance: bool,
     pub dismiss_extension_popup: bool,
     pub keep_modal: bool,
+    pub keep_find_in_page: bool,
     pub keep_reading_mode: bool,
     pub keep_oauth_popups: bool,
 }
@@ -487,6 +517,7 @@ pub const fn evaluate_activation_effects(action: ActivationAction) -> Activation
             dismiss_glance: false,
             dismiss_extension_popup: false,
             keep_modal: true,
+            keep_find_in_page: true,
             keep_reading_mode: true,
             keep_oauth_popups: true,
         },
@@ -498,6 +529,7 @@ pub const fn evaluate_activation_effects(action: ActivationAction) -> Activation
                 dismiss_glance: true,
                 dismiss_extension_popup: true,
                 keep_modal: true,
+                keep_find_in_page: true,
                 keep_reading_mode: true,
                 keep_oauth_popups: true,
             }
@@ -505,7 +537,23 @@ pub const fn evaluate_activation_effects(action: ActivationAction) -> Activation
     }
 }
 
-/// Returns `true` if `surface` remains open under `action` (`Modal` and `ReadingMode` stay open).
+/// Returns `true` if `kind` remains open under `action` (`Modal`, `ReadingMode`, and `FindInPage` stay open).
+pub const fn should_keep_active_kind(kind: ActiveOverlayKind, action: ActivationAction) -> bool {
+    match action {
+        ActivationAction::KeepAll => true,
+        ActivationAction::DismissTransientToMain | ActivationAction::HideTransientOutsideApp => {
+            matches!(
+                kind,
+                ActiveOverlayKind::Modal
+                    | ActiveOverlayKind::ReadingMode
+                    | ActiveOverlayKind::FindInPage
+            )
+        }
+    }
+}
+
+/// Returns `true` if `surface` remains open under `action` (`Modal` and `ReadingMode` stay open;
+/// use [`should_keep_active_kind`] when distinguishing `FindInPage` from `CommandPalette`).
 pub const fn should_keep_surface_open(surface: OverlaySurface, action: ActivationAction) -> bool {
     match action {
         ActivationAction::KeepAll => true,
@@ -777,40 +825,54 @@ mod tests {
     #[test]
     fn overlay_priority_stack_enforces_modal_fifo_and_strict_precedence() {
         let mut stack = OverlayPriorityStack::new();
+        assert_eq!(stack.active_kind(), None);
         assert_eq!(stack.active_surface(), None);
 
         stack.hover_sidebar_open = true;
+        assert_eq!(stack.active_kind(), Some(ActiveOverlayKind::HoverSidebar));
         assert_eq!(stack.active_surface(), Some(OverlaySurface::HoverSidebar));
 
         stack.reading_mode_open = true;
+        assert_eq!(stack.active_kind(), Some(ActiveOverlayKind::ReadingMode));
         assert_eq!(stack.active_surface(), Some(OverlaySurface::ReadingMode));
 
         stack.find_in_page_open = true;
+        assert_eq!(stack.active_kind(), Some(ActiveOverlayKind::FindInPage));
         assert_eq!(stack.active_surface(), Some(OverlaySurface::CommandPalette));
 
-        stack.find_in_page_open = false;
+        // CommandPalette preempts FindInPage while preserving find_in_page_open underneath.
         stack.command_palette_open = true;
+        assert_eq!(stack.active_kind(), Some(ActiveOverlayKind::CommandPalette));
         assert_eq!(stack.active_surface(), Some(OverlaySurface::CommandPalette));
 
         stack.push_modal("perm-1");
         stack.push_modal("perm-1"); // duplicate ignored
         stack.push_modal("dialog-2");
+        assert_eq!(stack.active_kind(), Some(ActiveOverlayKind::Modal));
         assert_eq!(stack.active_surface(), Some(OverlaySurface::Modal));
         assert_eq!(stack.active_modal(), Some("perm-1"));
         assert_eq!(stack.modal_count(), 2);
 
         assert_eq!(stack.pop_front_modal().as_deref(), Some("perm-1"));
         assert_eq!(stack.active_modal(), Some("dialog-2"));
+        assert_eq!(stack.active_kind(), Some(ActiveOverlayKind::Modal));
         assert_eq!(stack.active_surface(), Some(OverlaySurface::Modal));
 
         assert!(stack.resolve_modal("dialog-2"));
         assert!(!stack.resolve_modal("missing"));
+        assert_eq!(stack.active_kind(), Some(ActiveOverlayKind::CommandPalette));
         assert_eq!(stack.active_surface(), Some(OverlaySurface::CommandPalette));
 
         stack.command_palette_open = false;
+        assert_eq!(stack.active_kind(), Some(ActiveOverlayKind::FindInPage));
+        assert_eq!(stack.active_surface(), Some(OverlaySurface::CommandPalette));
+
+        stack.find_in_page_open = false;
+        assert_eq!(stack.active_kind(), Some(ActiveOverlayKind::ReadingMode));
         assert_eq!(stack.active_surface(), Some(OverlaySurface::ReadingMode));
 
         stack.reading_mode_open = false;
+        assert_eq!(stack.active_kind(), Some(ActiveOverlayKind::HoverSidebar));
         assert_eq!(stack.active_surface(), Some(OverlaySurface::HoverSidebar));
     }
 
@@ -852,6 +914,7 @@ mod tests {
 
         let mut stack = OverlayPriorityStack {
             command_palette_open: true,
+            find_in_page_open: true,
             reading_mode_open: true,
             hover_sidebar_open: true,
             ..OverlayPriorityStack::new()
@@ -864,12 +927,31 @@ mod tests {
         assert!(effects.dismiss_glance);
         assert!(effects.dismiss_extension_popup);
         assert!(effects.keep_modal);
+        assert!(effects.keep_find_in_page);
         assert!(effects.keep_reading_mode);
         assert!(effects.keep_oauth_popups);
         assert!(!stack.command_palette_open);
         assert!(!stack.hover_sidebar_open);
+        assert!(stack.find_in_page_open);
         assert!(stack.reading_mode_open);
         assert_eq!(stack.active_modal(), Some("perm-req-1"));
+        assert!(should_keep_active_kind(ActiveOverlayKind::Modal, to_main));
+        assert!(should_keep_active_kind(
+            ActiveOverlayKind::FindInPage,
+            to_main
+        ));
+        assert!(should_keep_active_kind(
+            ActiveOverlayKind::ReadingMode,
+            to_main
+        ));
+        assert!(!should_keep_active_kind(
+            ActiveOverlayKind::CommandPalette,
+            to_main
+        ));
+        assert!(!should_keep_active_kind(
+            ActiveOverlayKind::HoverSidebar,
+            to_main
+        ));
         assert!(should_keep_surface_open(OverlaySurface::Modal, to_main));
         assert!(should_keep_surface_open(
             OverlaySurface::ReadingMode,
@@ -884,7 +966,29 @@ mod tests {
             to_main
         ));
 
-        // Moving focus outside Nyari (Alt+Tab or None) hides transient overlays while preserving Modal & OAuth.
+        // Verify apply_activation + should_keep_active_kind agree when FindInPage is the active surface.
+        let mut find_stack = OverlayPriorityStack {
+            find_in_page_open: true,
+            command_palette_open: true,
+            hover_sidebar_open: true,
+            ..OverlayPriorityStack::new()
+        };
+        let find_effects = find_stack.apply_activation(to_main);
+        assert!(find_effects.keep_find_in_page);
+        assert_eq!(
+            find_stack.active_kind(),
+            Some(ActiveOverlayKind::FindInPage)
+        );
+        assert_eq!(
+            find_stack.active_surface(),
+            Some(OverlaySurface::CommandPalette)
+        );
+        assert!(should_keep_active_kind(
+            find_stack.active_kind().unwrap(),
+            to_main
+        ));
+
+        // Moving focus outside Nyari (Alt+Tab or None) hides transient overlays while preserving Modal, FindInPage & OAuth.
         let outside =
             classify_activation_change(Some(0x9999), &family, Some(OverlaySurface::CommandPalette));
         assert_eq!(outside, ActivationAction::HideTransientOutsideApp);
@@ -896,7 +1000,16 @@ mod tests {
         assert!(outside_effects.dismiss_command_palette);
         assert!(outside_effects.dismiss_glance);
         assert!(outside_effects.keep_modal);
+        assert!(outside_effects.keep_find_in_page);
         assert!(outside_effects.keep_oauth_popups);
+        assert!(should_keep_active_kind(
+            ActiveOverlayKind::FindInPage,
+            outside
+        ));
+        assert!(!should_keep_active_kind(
+            ActiveOverlayKind::CommandPalette,
+            outside
+        ));
     }
 
     #[test]
