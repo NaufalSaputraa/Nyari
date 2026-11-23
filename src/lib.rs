@@ -1,7 +1,10 @@
 use std::fmt;
 
+pub mod backdrop;
 pub mod cli;
+pub mod dpi;
 pub mod ipc;
+pub mod layout;
 pub mod single_instance;
 pub mod storage;
 
