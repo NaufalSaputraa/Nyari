@@ -1,0 +1,56 @@
+[package]
+name = "nyari"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+tao = "0.37"
+webview2-com = "0.39"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Security_Credentials_UI",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Authorization",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "net"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+adblock = { version = "0.13", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+aes-gcm = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
+keyring = { version = "3", features = ["windows-native"] }
+zeroize = { version = "1", features = ["derive"] }
+include_dir = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zstd = "0.14"
+zip = "9"
+url = "2"
+base64 = "0.23"
+uuid = { version = "1", features = ["v4"] }
