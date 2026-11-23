@@ -4,7 +4,7 @@ use crate::NyariError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use include_dir::{include_dir, Dir};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::ptr;
 use std::rc::Rc;
@@ -24,10 +24,11 @@ use webview2_com::{
     take_pwstr, AcceleratorKeyPressedEventHandler, BrowserProcessExitedEventHandler,
     CoreWebView2CustomSchemeRegistration, CoreWebView2EnvironmentOptions,
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
-    NavigationStartingEventHandler, NewBrowserVersionAvailableEventHandler,
-    WebMessageReceivedEventHandler, WebResourceRequestedEventHandler,
+    NavigationCompletedEventHandler, NavigationStartingEventHandler,
+    NewBrowserVersionAvailableEventHandler, WebMessageReceivedEventHandler,
+    WebResourceRequestedEventHandler,
 };
-use windows::core::{w, Interface, PCWSTR, PWSTR};
+use windows::core::{w, Interface, BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{E_FAIL, HWND, RECT};
 use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_ESCAPE, VK_SHIFT};
@@ -249,6 +250,15 @@ pub fn create_environment_options(
 /// Validates that `uri` belongs strictly to the `nyari://shell/` origin.
 pub fn is_allowed_shell_navigation(uri: &str) -> bool {
     uri.starts_with("nyari://shell/")
+}
+
+/// Determines whether `NavigationCompleted` should fire `on_ready()` once for `nyari://shell/`.
+pub fn should_fire_shell_ready(already_fired: &mut bool, is_success: bool, uri: &str) -> bool {
+    if *already_fired || !is_success || !is_allowed_shell_navigation(uri) {
+        return false;
+    }
+    *already_fired = true;
+    true
 }
 
 /// Validates `WebMessageReceived` `Source()` starts with `nyari://shell/` and parses `UIAction`.
@@ -651,12 +661,50 @@ pub fn create_shell_controller<E: 'static>(
                 let _ = controller.add_AcceleratorKeyPressed(&accel_handler, &mut accel_token);
             }
 
+            *controller_slot.borrow_mut() = Some(controller);
+
+            let mut nav_completed_token = 0i64;
+            let fired_ready = Rc::new(Cell::new(false));
+            let proxy_ready = proxy.clone();
+            let nav_completed_handler =
+                NavigationCompletedEventHandler::create(Box::new(move |webview_opt, args_opt| {
+                    let is_success = args_opt
+                        .and_then(|args| {
+                            let mut ok = BOOL(0);
+                            unsafe { args.IsSuccess(&mut ok) }
+                                .ok()
+                                .map(|()| ok.as_bool())
+                        })
+                        .unwrap_or(false);
+                    let source = webview_opt
+                        .and_then(|wv| {
+                            let mut pwstr = PWSTR(ptr::null_mut());
+                            unsafe { wv.Source(&mut pwstr) }
+                                .ok()
+                                .map(|()| take_pwstr(pwstr))
+                        })
+                        .unwrap_or_default();
+
+                    let mut fired_flag = fired_ready.get();
+                    if should_fire_shell_ready(&mut fired_flag, is_success, &source) {
+                        fired_ready.set(fired_flag);
+                        let _ = proxy_ready.send_event((mapper.on_ready)());
+                    } else if !fired_flag && !is_success {
+                        let _ = proxy_ready.send_event((mapper.on_error)(format!(
+                            "Shell UI navigation failed for {source}"
+                        )));
+                    }
+                    Ok(())
+                }));
+            unsafe {
+                let _ = webview
+                    .add_NavigationCompleted(&nav_completed_handler, &mut nav_completed_token);
+            }
+
             let uri_w = to_wide_null(shell_uri);
             unsafe {
                 let _ = webview.Navigate(PCWSTR(uri_w.as_ptr()));
             }
-            *controller_slot.borrow_mut() = Some(controller);
-            let _ = proxy.send_event((mapper.on_ready)());
             Ok(())
         },
     ));
@@ -888,5 +936,36 @@ mod tests {
             parse_shell_web_message("https://evil.example.com/", r#"{"type":"WINDOW_CLOSE"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn should_fire_shell_ready_gates_on_first_successful_nyari_shell_navigation() {
+        let mut fired = false;
+        assert!(!should_fire_shell_ready(
+            &mut fired,
+            false,
+            "nyari://shell/?layer=chrome"
+        ));
+        assert!(!fired);
+
+        assert!(!should_fire_shell_ready(
+            &mut fired,
+            true,
+            "https://example.com/"
+        ));
+        assert!(!fired);
+
+        assert!(should_fire_shell_ready(
+            &mut fired,
+            true,
+            "nyari://shell/?layer=chrome"
+        ));
+        assert!(fired);
+
+        assert!(!should_fire_shell_ready(
+            &mut fired,
+            true,
+            "nyari://shell/?layer=chrome"
+        ));
     }
 }

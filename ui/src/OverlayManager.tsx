@@ -1,5 +1,5 @@
 import { effect } from "@preact/signals";
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { CommandPalette } from "./CommandPalette";
 import { ReaderView } from "./ReaderView";
 import { Sidebar } from "./Sidebar";
@@ -33,6 +33,72 @@ function closeTopOverlay() {
     hoverSidebarOpen.value = false;
   }
   sendAction({ type: "CLOSE_OVERLAY" });
+}
+
+function FindInPageBar({ onClose }: { onClose: () => void }) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const tabId = activeTabId.value ?? "";
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  return (
+    <section class="find-bar" aria-label="Find in page">
+      <input
+        ref={inputRef}
+        type="text"
+        class="find-input"
+        value={findQuery.value}
+        placeholder="Find in page..."
+        aria-label="Find text in page"
+        onInput={(e) => {
+          const q = (e.currentTarget as HTMLInputElement).value;
+          findQuery.value = q;
+          if (tabId) {
+            sendAction({
+              type: "FIND_IN_PAGE",
+              tabId,
+              query: q,
+              matchCase: false,
+              wholeWord: false
+            });
+          }
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && tabId) {
+            sendAction({ type: "FIND_NEXT", tabId, forward: !e.shiftKey });
+          } else if (e.key === "Escape") {
+            onClose();
+          }
+        }}
+      />
+      <span class="palette-item-meta">
+        {findMatchInfo.value.activeMatch}/{findMatchInfo.value.matchCount}
+      </span>
+      <button
+        type="button"
+        class="icon-btn"
+        aria-label="Previous match"
+        disabled={!tabId}
+        onClick={() => tabId && sendAction({ type: "FIND_NEXT", tabId, forward: false })}
+      >
+        &lt;
+      </button>
+      <button
+        type="button"
+        class="icon-btn"
+        aria-label="Next match"
+        disabled={!tabId}
+        onClick={() => tabId && sendAction({ type: "FIND_NEXT", tabId, forward: true })}
+      >
+        &gt;
+      </button>
+      <button type="button" class="icon-btn" aria-label="Close find" onClick={onClose}>
+        x
+      </button>
+    </section>
+  );
 }
 
 export function OverlayManager() {
@@ -399,62 +465,7 @@ export function OverlayManager() {
   }
 
   if (findInPageOpen.value) {
-    const tabId = activeTabId.value ?? "";
-    return (
-      <section class="find-bar" aria-label="Find in page">
-        <input
-          type="text"
-          class="find-input"
-          value={findQuery.value}
-          placeholder="Find in page..."
-          aria-label="Find text in page"
-          onInput={(e) => {
-            const q = (e.currentTarget as HTMLInputElement).value;
-            findQuery.value = q;
-            if (tabId) {
-              sendAction({
-                type: "FIND_IN_PAGE",
-                tabId,
-                query: q,
-                matchCase: false,
-                wholeWord: false
-              });
-            }
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && tabId) {
-              sendAction({ type: "FIND_NEXT", tabId, forward: !e.shiftKey });
-            } else if (e.key === "Escape") {
-              closeTopOverlay();
-            }
-          }}
-        />
-        <span class="palette-item-meta">
-          {findMatchInfo.value.activeMatch}/{findMatchInfo.value.matchCount}
-        </span>
-        <button
-          type="button"
-          class="icon-btn"
-          aria-label="Previous match"
-          disabled={!tabId}
-          onClick={() => tabId && sendAction({ type: "FIND_NEXT", tabId, forward: false })}
-        >
-          &lt;
-        </button>
-        <button
-          type="button"
-          class="icon-btn"
-          aria-label="Next match"
-          disabled={!tabId}
-          onClick={() => tabId && sendAction({ type: "FIND_NEXT", tabId, forward: true })}
-        >
-          &gt;
-        </button>
-        <button type="button" class="icon-btn" aria-label="Close find" onClick={closeTopOverlay}>
-          x
-        </button>
-      </section>
-    );
+    return <FindInPageBar onClose={closeTopOverlay} />;
   }
 
   if (readingModeOpen.value) {

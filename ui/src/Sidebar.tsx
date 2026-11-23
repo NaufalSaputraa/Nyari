@@ -5,6 +5,7 @@ import {
   runtimeUpdateVersion,
   sendAction,
   settings,
+  switchTab,
   workspaces
 } from "./store";
 
@@ -138,7 +139,7 @@ export function Sidebar({ collapsed, isHoverOverlay = false, onCloseOverlay }: S
                 class={isActive ? "pinned-tile pinned-tile--active" : "pinned-tile"}
                 title={tab.title || tab.url}
                 aria-label={`Pinned tab ${tab.title || tab.url}`}
-                onClick={() => sendAction({ type: "SWITCH_TAB", tabId: tab.id })}
+                onClick={() => switchTab(tab.id)}
               >
                 {(tab.title || "T").slice(0, 1).toUpperCase()}
               </button>
@@ -187,7 +188,7 @@ export function Sidebar({ collapsed, isHoverOverlay = false, onCloseOverlay }: S
                   class="tab-main-btn"
                   title={tab.title || tab.url}
                   onClick={() => {
-                    sendAction({ type: "SWITCH_TAB", tabId: tab.id });
+                    switchTab(tab.id);
                     if (isHoverOverlay && onCloseOverlay) onCloseOverlay();
                   }}
                 >

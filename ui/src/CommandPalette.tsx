@@ -5,6 +5,7 @@ import {
   omniboxResults,
   sendAction,
   settings,
+  switchTab,
   tabs
 } from "./store";
 
@@ -88,7 +89,7 @@ export function CommandPalette({ onClose }: CommandPaletteProps) {
       id: `tab-${t.id}`,
       title: t.title || t.url || "Untitled Tab",
       meta: "tab",
-      run: () => sendAction({ type: "SWITCH_TAB", tabId: t.id })
+      run: () => switchTab(t.id)
     }));
 
   const remoteHits: PaletteEntry[] = omniboxResults.value.map((item) => ({

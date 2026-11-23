@@ -1,4 +1,12 @@
-import { activeTab, activeTabId, activeWorkspaceId, activeWorkspaceTabs, sendAction, settings } from "./store";
+import {
+  activeTab,
+  activeTabId,
+  activeWorkspaceId,
+  activeWorkspaceTabs,
+  sendAction,
+  settings,
+  switchTab
+} from "./store";
 
 export function WindowControls() {
   return (
@@ -91,7 +99,7 @@ export function TopBar() {
               role="tab"
               aria-selected={isActive}
               class={isActive ? "topbar-tab-chip topbar-tab-chip--active" : "topbar-tab-chip"}
-              onClick={() => sendAction({ type: "SWITCH_TAB", tabId: tab.id })}
+              onClick={() => switchTab(tab.id)}
             >
               <span class="tab-title">{tab.title || tab.url || "New Tab"}</span>
             </button>

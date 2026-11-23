@@ -48,11 +48,11 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CreateWindowExW, DefWindowProcW, DeferWindowPos, DestroyWindow,
-    EndDeferWindowPos, GetClientRect, LoadCursorW, MessageBoxW, RegisterClassExW, SendMessageW,
-    SetWindowPos, ShowWindow, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTMAXBUTTON, HTRIGHT,
-    HTTOP, HTTOPLEFT, HTTOPRIGHT, HTTRANSPARENT, HWND_TOP, IDC_ARROW, MB_ICONERROR, MB_OK,
-    NCCALCSIZE_PARAMS, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, WA_INACTIVE,
+    EndDeferWindowPos, GetClientRect, IsWindowVisible, LoadCursorW, MessageBoxW, RegisterClassExW,
+    SendMessageW, SetWindowPos, ShowWindow, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT,
+    HTMAXBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HTTRANSPARENT, HWND_TOP, IDC_ARROW,
+    MB_ICONERROR, MB_OK, NCCALCSIZE_PARAMS, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOWNORMAL, WA_INACTIVE,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND, WM_MOVE,
     WM_MOVING, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
     WM_PAINT, WM_WINDOWPOSCHANGED, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
@@ -604,25 +604,42 @@ fn init_shell_controllers(state: &Rc<RefCell<AppState>>, proxy: &EventLoopProxy<
 }
 
 fn push_initial_shell_state(state: &Rc<RefCell<AppState>>) {
-    let (settings, tabs, controllers) = {
+    let (settings, tabs, active_tab_id, controllers) = {
         let st = state.borrow();
         (
             st.settings.clone(),
             st.tabs.clone(),
+            st.active_tab_id.clone(),
             st.controllers_snapshot(),
         )
     };
     let settings_ev = UIEvent::SettingsUpdated { settings };
-    if let Some(c1) = &controllers.0 {
-        let _ = post_ui_event(c1, &settings_ev);
+    let active_js = to_wide_null(&sync_active_tab_script(active_tab_id.as_deref()));
+
+    for controller in [controllers.0, controllers.1].into_iter().flatten() {
+        let _ = post_ui_event(&controller, &settings_ev);
         for tab in &tabs {
-            let _ = post_ui_event(c1, &UIEvent::TabCreated { tab: tab.clone() });
+            let _ = post_ui_event(&controller, &UIEvent::TabCreated { tab: tab.clone() });
+        }
+        if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+            unsafe {
+                let _ = wv.ExecuteScript(PCWSTR(active_js.as_ptr()), None);
+            }
         }
     }
-    if let Some(c2) = &controllers.1 {
-        let _ = post_ui_event(c2, &settings_ev);
-        for tab in &tabs {
-            let _ = post_ui_event(c2, &UIEvent::TabCreated { tab: tab.clone() });
+}
+
+fn broadcast_active_tab(state: &Rc<RefCell<AppState>>) {
+    let (active_tab_id, controllers) = {
+        let st = state.borrow();
+        (st.active_tab_id.clone(), st.controllers_snapshot())
+    };
+    let js_w = to_wide_null(&sync_active_tab_script(active_tab_id.as_deref()));
+    for controller in [controllers.0, controllers.1].into_iter().flatten() {
+        if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+            unsafe {
+                let _ = wv.ExecuteScript(PCWSTR(js_w.as_ptr()), None);
+            }
         }
     }
 }
@@ -798,7 +815,7 @@ fn sync_window_layout(state: &Rc<RefCell<AppState>>) {
     state.borrow().in_layout_sync.set(false);
 }
 
-fn position_layer2_popup(state: &Rc<RefCell<AppState>>) {
+fn position_layer2_popup(state: &Rc<RefCell<AppState>>, show_and_focus: bool) {
     let (handles, rect_dip_opt, c2_opt) = {
         let st = state.borrow();
         let snapshot = (
@@ -824,6 +841,11 @@ fn position_layer2_popup(state: &Rc<RefCell<AppState>>) {
     let y_rel = dip_to_phys(y_dip, dpi).clamp(0, (client_h - h_phys).max(0));
 
     let mut origin = POINT { x: x_rel, y: y_rel };
+    let swp_flags = if show_and_focus {
+        SWP_NOZORDER | SWP_SHOWWINDOW
+    } else {
+        SWP_NOZORDER | SWP_NOACTIVATE
+    };
     unsafe {
         let _ = ClientToScreen(handles.main_hwnd, &mut origin);
         let _ = SetWindowPos(
@@ -833,7 +855,7 @@ fn position_layer2_popup(state: &Rc<RefCell<AppState>>) {
             origin.y,
             w_phys,
             h_phys,
-            SWP_NOZORDER | SWP_SHOWWINDOW,
+            swp_flags,
         );
     }
 
@@ -846,6 +868,9 @@ fn position_layer2_popup(state: &Rc<RefCell<AppState>>) {
                 bottom: h_phys,
             });
             let _ = c2.SetIsVisible(true);
+            if show_and_focus {
+                let _ = c2.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            }
         }
     }
 }
@@ -920,6 +945,7 @@ fn open_stub_tab(state: &Rc<RefCell<AppState>>, url: Option<String>, is_private:
     if let Some(c2) = controllers.1 {
         let _ = post_ui_event(&c2, &ev);
     }
+    broadcast_active_tab(state);
 }
 
 fn handle_shortcut(state: &Rc<RefCell<AppState>>, shortcut: ShortcutAction) {
@@ -969,8 +995,8 @@ fn handle_ui_action(
 ) -> bool {
     match action {
         UIAction::GetSettings => {
-            let settings = state.borrow().settings.clone();
-            broadcast_ui_event(state, &UIEvent::SettingsUpdated { settings });
+            push_initial_shell_state(state);
+            sync_layer2_viewport_script(state);
         }
         UIAction::UpdateSettings { patch } => {
             let (settings, data_dir) = {
@@ -1012,13 +1038,12 @@ fn handle_ui_action(
             height_dip,
         } => {
             if let (true, Some(surf)) = (visible, surface) {
-                state.borrow_mut().last_overlay_rect_dip =
-                    Some((surf, x_dip, y_dip, width_dip, height_dip));
-                position_layer2_popup(state);
-                let handles = state.borrow().handles;
-                unsafe {
-                    let _ = ShowWindow(handles.layer2_popup_hwnd, SW_SHOW);
-                }
+                let was_visible = {
+                    let mut st = state.borrow_mut();
+                    st.last_overlay_rect_dip = Some((surf, x_dip, y_dip, width_dip, height_dip));
+                    unsafe { IsWindowVisible(st.handles.layer2_popup_hwnd).as_bool() }
+                };
+                position_layer2_popup(state, !was_visible);
             } else {
                 hide_layer2_popup(state, true);
             }
@@ -1043,15 +1068,29 @@ fn handle_ui_action(
         UIAction::CloseTab { tab_id } => {
             {
                 let mut st = state.borrow_mut();
-                st.tabs.retain(|t| t.id != tab_id);
-                if st.active_tab_id.as_deref() == Some(tab_id.as_str()) {
-                    st.active_tab_id = st.tabs.first().map(|t| t.id.clone());
-                }
+                let AppState {
+                    tabs,
+                    active_tab_id,
+                    ..
+                } = &mut *st;
+                close_tab_and_select_next(tabs, active_tab_id, &tab_id);
             }
             broadcast_ui_event(state, &UIEvent::TabClosed { tab_id });
+            broadcast_active_tab(state);
         }
         UIAction::SwitchTab { tab_id } => {
-            state.borrow_mut().active_tab_id = Some(tab_id);
+            let switched = {
+                let mut st = state.borrow_mut();
+                let AppState {
+                    tabs,
+                    active_tab_id,
+                    ..
+                } = &mut *st;
+                switch_active_tab(tabs, active_tab_id, &tab_id)
+            };
+            if switched {
+                broadcast_active_tab(state);
+            }
         }
         UIAction::Navigate {
             tab_id,
@@ -1188,52 +1227,32 @@ fn perform_graceful_shutdown(state: &Rc<RefCell<AppState>>) {
 
 fn handle_family_activation_deactivation(state: &Rc<RefCell<AppState>>, gaining_hwnd: HWND) {
     let gained_root = get_ancestor_root(gaining_hwnd);
-    let (action, active_kind_after, c2_opt) = {
+    let (transition, c2_opt) = {
         let Ok(mut st) = state.try_borrow_mut() else {
             return;
         };
         let family = st.window_family();
-        let active_surface = st.overlay_stack.active_surface();
-        let action = classify_activation_change(gained_root, &family, active_surface);
-        st.overlay_stack.apply_activation(action);
-        if let Some(kind) = st.overlay_stack.active_kind() {
-            if !should_keep_active_kind(kind, action) {
-                match kind {
-                    ActiveOverlayKind::CommandPalette => {
-                        st.overlay_stack.command_palette_open = false;
-                    }
-                    ActiveOverlayKind::HoverSidebar => {
-                        st.overlay_stack.hover_sidebar_open = false;
-                    }
-                    ActiveOverlayKind::Modal
-                    | ActiveOverlayKind::FindInPage
-                    | ActiveOverlayKind::ReadingMode => {}
-                }
-            }
-        }
-        let snapshot = (
-            action,
-            st.overlay_stack.active_kind(),
-            st.layer2_controller.borrow().clone(),
-        );
+        let transition = apply_activation_transition(&mut st.overlay_stack, gained_root, &family);
+        let snapshot = (transition, st.layer2_controller.borrow().clone());
         snapshot
     };
 
-    if action != nyari::layout::ActivationAction::KeepAll {
+    if transition.dismissed_command_palette || transition.dismissed_hover_sidebar {
         if let Some(c2) = c2_opt {
-            let _ = post_ui_event(
-                &c2,
-                &UIEvent::ShortcutTriggered {
-                    action: ShortcutAction::CloseActiveOverlay,
-                },
-            );
+            let script_w = to_wide_null(&sync_transient_dismissal_script(
+                transition.dismissed_command_palette,
+                transition.dismissed_hover_sidebar,
+            ));
+            if let Ok(wv) = unsafe { c2.CoreWebView2() } {
+                unsafe {
+                    let _ = wv.ExecuteScript(PCWSTR(script_w.as_ptr()), None);
+                }
+            }
         }
-        if active_kind_after.is_none() {
-            hide_layer2_popup(
-                state,
-                action == nyari::layout::ActivationAction::DismissTransientToMain,
-            );
-        }
+    }
+
+    if transition.should_hide_popup {
+        hide_layer2_popup(state, transition.restore_focus_to_main);
     }
 }
 
@@ -1283,8 +1302,8 @@ unsafe extern "system" fn main_hwnd_subclass_proc(
                 Rc::from_raw(ptr)
             };
             sync_window_layout(&state_rc);
-            if state_rc.borrow().last_overlay_rect_dip.is_some() {
-                position_layer2_popup(&state_rc);
+            if should_reposition_visible_layer2(&state_rc) {
+                position_layer2_popup(&state_rc, false);
             }
             res
         }
@@ -1308,7 +1327,9 @@ unsafe extern "system" fn main_hwnd_subclass_proc(
                         Rc::increment_strong_count(ptr);
                         Rc::from_raw(ptr)
                     };
-                    position_layer2_popup(&state_rc);
+                    if should_reposition_visible_layer2(&state_rc) {
+                        position_layer2_popup(&state_rc, false);
+                    }
                 }
             }
             unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
@@ -1320,8 +1341,8 @@ unsafe extern "system" fn main_hwnd_subclass_proc(
                 Rc::from_raw(ptr)
             };
             sync_window_layout(&state_rc);
-            if state_rc.borrow().last_overlay_rect_dip.is_some() {
-                position_layer2_popup(&state_rc);
+            if should_reposition_visible_layer2(&state_rc) {
+                position_layer2_popup(&state_rc, false);
             }
             unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
         }
@@ -1512,11 +1533,250 @@ unsafe extern "system" fn layer2_popup_subclass_proc(
     }
 }
 
+fn should_reposition_visible_layer2(state: &Rc<RefCell<AppState>>) -> bool {
+    let Ok(st) = state.try_borrow() else {
+        return false;
+    };
+    st.last_overlay_rect_dip.is_some()
+        && unsafe { IsWindowVisible(st.handles.layer2_popup_hwnd).as_bool() }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransientDismissalResult {
+    action: nyari::layout::ActivationAction,
+    dismissed_command_palette: bool,
+    dismissed_hover_sidebar: bool,
+    should_hide_popup: bool,
+    restore_focus_to_main: bool,
+}
+
+fn apply_activation_transition(
+    stack: &mut OverlayPriorityStack,
+    gained_root: Option<isize>,
+    family: &NyariWindowFamily,
+) -> TransientDismissalResult {
+    let active_surface = stack.active_surface();
+    let action = classify_activation_change(gained_root, family, active_surface);
+    if action == nyari::layout::ActivationAction::KeepAll {
+        return TransientDismissalResult {
+            action,
+            dismissed_command_palette: false,
+            dismissed_hover_sidebar: false,
+            should_hide_popup: false,
+            restore_focus_to_main: false,
+        };
+    }
+
+    let had_cmd = stack.command_palette_open;
+    let had_hover = stack.hover_sidebar_open;
+    stack.apply_activation(action);
+    if let Some(kind) = stack.active_kind() {
+        if !should_keep_active_kind(kind, action) {
+            match kind {
+                ActiveOverlayKind::CommandPalette => stack.command_palette_open = false,
+                ActiveOverlayKind::HoverSidebar => stack.hover_sidebar_open = false,
+                ActiveOverlayKind::Modal
+                | ActiveOverlayKind::FindInPage
+                | ActiveOverlayKind::ReadingMode => {}
+            }
+        }
+    }
+
+    let dismissed_command_palette = had_cmd && !stack.command_palette_open;
+    let dismissed_hover_sidebar = had_hover && !stack.hover_sidebar_open;
+    let should_hide_popup = stack.active_kind().is_none();
+    let restore_focus_to_main =
+        should_hide_popup && action == nyari::layout::ActivationAction::DismissTransientToMain;
+
+    TransientDismissalResult {
+        action,
+        dismissed_command_palette,
+        dismissed_hover_sidebar,
+        should_hide_popup,
+        restore_focus_to_main,
+    }
+}
+
+fn sync_transient_dismissal_script(clear_cmd: bool, clear_hover: bool) -> String {
+    format!("window.__NYARI_DISMISS_TRANSIENT__?.({clear_cmd}, {clear_hover});")
+}
+
+fn switch_active_tab(
+    tabs: &[TabMetadata],
+    active_tab_id: &mut Option<String>,
+    tab_id: &str,
+) -> bool {
+    if tabs.iter().any(|t| t.id == tab_id) {
+        *active_tab_id = Some(tab_id.to_string());
+        true
+    } else {
+        false
+    }
+}
+
+fn close_tab_and_select_next(
+    tabs: &mut Vec<TabMetadata>,
+    active_tab_id: &mut Option<String>,
+    tab_id: &str,
+) -> Option<String> {
+    tabs.retain(|t| t.id != tab_id);
+    if active_tab_id.as_deref() == Some(tab_id) {
+        *active_tab_id = tabs.first().map(|t| t.id.clone());
+    }
+    active_tab_id.clone()
+}
+
+fn sync_active_tab_script(active_tab_id: Option<&str>) -> String {
+    let encoded = serde_json::to_string(&active_tab_id).unwrap_or_else(|_| "null".to_string());
+    format!("window.__NYARI_SET_ACTIVE_TAB__?.({encoded});")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn sample_tab(id: &str) -> TabMetadata {
+        TabMetadata {
+            id: id.to_string(),
+            workspace_id: "ws-default".to_string(),
+            title: id.to_string(),
+            url: format!("https://{id}.example.com"),
+            favicon_url: String::new(),
+            is_pinned: false,
+            is_private: false,
+            is_oauth_popup: false,
+            keep_awake: false,
+            has_unsaved_input: false,
+            can_go_back: false,
+            can_go_forward: false,
+            is_loading: false,
+            is_audible: false,
+            shield_blocked_count: 0,
+            memory_state: MemoryState::Active,
+            ram_bytes: 0,
+        }
+    }
+
+    fn sample_family() -> NyariWindowFamily {
+        NyariWindowFamily {
+            main_hwnd: 100,
+            shell_overlay_hwnd: Some(200),
+            glance_hwnd: None,
+            extension_popup_hwnd: None,
+            oauth_popup_hwnds: Vec::new(),
+        }
+    }
+
     #[test]
     fn windows_subsystem_is_configured_for_release_binary() {
         // Compile-time smoke anchor ensuring binary target builds cleanly alongside lib target.
         assert_eq!(super::MAIN_SUBCLASS_ID, 1001);
+    }
+
+    #[test]
+    fn activation_transition_preserves_persistent_surfaces_without_transient_dismissal() {
+        let family = sample_family();
+
+        // FindInPage stays open when clicking main_hwnd or switching outside app.
+        let mut find_stack = OverlayPriorityStack::new();
+        find_stack.find_in_page_open = true;
+        let res_main = apply_activation_transition(&mut find_stack, Some(100), &family);
+        assert_eq!(
+            res_main.action,
+            nyari::layout::ActivationAction::DismissTransientToMain
+        );
+        assert!(!res_main.dismissed_command_palette);
+        assert!(!res_main.dismissed_hover_sidebar);
+        assert!(!res_main.should_hide_popup);
+        assert_eq!(
+            find_stack.active_kind(),
+            Some(ActiveOverlayKind::FindInPage)
+        );
+
+        // ReadingMode stays open on Alt+Tab outside app.
+        let mut reader_stack = OverlayPriorityStack::new();
+        reader_stack.reading_mode_open = true;
+        let res_ext = apply_activation_transition(&mut reader_stack, Some(999), &family);
+        assert_eq!(
+            res_ext.action,
+            nyari::layout::ActivationAction::HideTransientOutsideApp
+        );
+        assert!(!res_ext.dismissed_command_palette);
+        assert!(!res_ext.dismissed_hover_sidebar);
+        assert!(!res_ext.should_hide_popup);
+        assert_eq!(
+            reader_stack.active_kind(),
+            Some(ActiveOverlayKind::ReadingMode)
+        );
+
+        // Modal stays open.
+        let mut modal_stack = OverlayPriorityStack::new();
+        modal_stack.push_modal("req-1");
+        let res_modal = apply_activation_transition(&mut modal_stack, Some(100), &family);
+        assert!(!res_modal.dismissed_command_palette);
+        assert!(!res_modal.dismissed_hover_sidebar);
+        assert!(!res_modal.should_hide_popup);
+        assert_eq!(modal_stack.active_kind(), Some(ActiveOverlayKind::Modal));
+    }
+
+    #[test]
+    fn activation_transition_clears_both_transient_surfaces_together_and_keeps_underlying_persistent(
+    ) {
+        let family = sample_family();
+
+        // Both CommandPalette and HoverSidebar open: both clear and popup hides.
+        let mut both_transient = OverlayPriorityStack::new();
+        both_transient.command_palette_open = true;
+        both_transient.hover_sidebar_open = true;
+        let res = apply_activation_transition(&mut both_transient, Some(100), &family);
+        assert!(res.dismissed_command_palette);
+        assert!(res.dismissed_hover_sidebar);
+        assert!(res.should_hide_popup);
+        assert!(res.restore_focus_to_main);
+        assert_eq!(both_transient.active_kind(), None);
+
+        // CommandPalette + ReadingMode open: CommandPalette clears, ReadingMode remains, popup stays visible.
+        let mut stacked = OverlayPriorityStack::new();
+        stacked.command_palette_open = true;
+        stacked.reading_mode_open = true;
+        let res_stacked = apply_activation_transition(&mut stacked, Some(100), &family);
+        assert!(res_stacked.dismissed_command_palette);
+        assert!(!res_stacked.dismissed_hover_sidebar);
+        assert!(!res_stacked.should_hide_popup);
+        assert!(!res_stacked.restore_focus_to_main);
+        assert_eq!(stacked.active_kind(), Some(ActiveOverlayKind::ReadingMode));
+
+        let js = sync_transient_dismissal_script(true, true);
+        assert!(js.contains("__NYARI_DISMISS_TRANSIENT__"));
+        assert!(js.contains("true, true"));
+    }
+
+    #[test]
+    fn switch_and_close_tab_helpers_sync_active_tab_id_reliably() {
+        let mut tabs = vec![sample_tab("tab-1"), sample_tab("tab-2")];
+        let mut active = Some("tab-1".to_string());
+
+        assert!(switch_active_tab(&tabs, &mut active, "tab-2"));
+        assert_eq!(active.as_deref(), Some("tab-2"));
+
+        assert!(!switch_active_tab(&tabs, &mut active, "tab-missing"));
+        assert_eq!(active.as_deref(), Some("tab-2"));
+
+        let next = close_tab_and_select_next(&mut tabs, &mut active, "tab-2");
+        assert_eq!(next.as_deref(), Some("tab-1"));
+        assert_eq!(active.as_deref(), Some("tab-1"));
+
+        let empty_next = close_tab_and_select_next(&mut tabs, &mut active, "tab-1");
+        assert_eq!(empty_next, None);
+        assert_eq!(active, None);
+
+        assert_eq!(
+            sync_active_tab_script(Some("tab-1")),
+            r#"window.__NYARI_SET_ACTIVE_TAB__?.("tab-1");"#
+        );
+        assert_eq!(
+            sync_active_tab_script(None),
+            "window.__NYARI_SET_ACTIVE_TAB__?.(null);"
+        );
     }
 }

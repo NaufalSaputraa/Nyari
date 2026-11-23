@@ -194,6 +194,8 @@ declare global {
       widthDip: number;
       heightDip: number;
     };
+    __NYARI_DISMISS_TRANSIENT__?: (clearCmd: boolean, clearHover: boolean) => void;
+    __NYARI_SET_ACTIVE_TAB__?: (tabId: string | null) => void;
   }
 }
 
@@ -264,6 +266,11 @@ export function sendAction(action: UIAction): void {
   if (webview) {
     webview.postMessage(JSON.stringify(action));
   }
+}
+
+export function switchTab(tabId: string): void {
+  activeTabId.value = tabId;
+  sendAction({ type: "SWITCH_TAB", tabId });
 }
 
 export function popModal(requestId: string): void {
@@ -359,6 +366,15 @@ let bridgeInitialized = false;
 export function initIpcBridge(): void {
   if (bridgeInitialized) return;
   bridgeInitialized = true;
+
+  window.__NYARI_DISMISS_TRANSIENT__ = (clearCmd: boolean, clearHover: boolean) => {
+    if (clearCmd) commandPaletteOpen.value = false;
+    if (clearHover) hoverSidebarOpen.value = false;
+  };
+
+  window.__NYARI_SET_ACTIVE_TAB__ = (tabId: string | null) => {
+    activeTabId.value = tabId;
+  };
 
   window.addEventListener("nyari-viewport", () => {
     if (window.__NYARI_VIEWPORT__) {
